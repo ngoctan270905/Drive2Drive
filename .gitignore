@@ -1,0 +1,11 @@
+# Các file chứa thông tin nhạy cảm của Google
+credentials.json
+token.json
+
+# Môi trường ảo Python
+.venv/
+__pycache__/
+
+# Các file rác hệ thống
+.DS_Store
+thumbs.db
