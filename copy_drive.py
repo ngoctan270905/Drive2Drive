@@ -1,4 +1,7 @@
 import os.path
+import time
+import socket
+import http.client
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -25,6 +28,128 @@ from googleapiclient.errors import HttpError
 #
 # =========================================================
 SCOPES = ['https://www.googleapis.com/auth/drive']
+
+
+def execute_with_retry(request, max_retries=5):
+    """
+    Execute Google API request với cơ chế retry tự động.
+
+    =====================================================
+    Tại sao cần retry?
+    =====================================================
+
+    Khi xử lý số lượng lớn file/folder trên Google Drive,
+    rất dễ gặp các lỗi tạm thời như:
+
+    - mất mạng
+    - DNS resolve fail
+    - Google API timeout
+    - rate limit
+    - Google server lỗi tạm thời
+
+    Ví dụ:
+    -----------------------------------------------------
+    socket.gaierror
+    RemoteDisconnected
+    HTTP 500
+    HTTP 503
+    HTTP 429
+
+    Nếu không retry:
+    -> script sẽ chết giữa chừng.
+
+    =====================================================
+    Cách hoạt động
+    =====================================================
+
+    1. Thử execute request
+    2. Nếu thành công:
+        -> return kết quả ngay
+    3. Nếu lỗi mạng/server:
+        -> sleep theo exponential backoff
+        -> retry lại
+    4. Nếu retry quá số lần:
+        -> raise exception
+
+    =====================================================
+    Exponential Backoff
+    =====================================================
+
+    Retry lần:
+    - 1 -> chờ 1s
+    - 2 -> chờ 2s
+    - 3 -> chờ 4s
+    - 4 -> chờ 8s
+    ...
+
+    Điều này giúp:
+    - giảm spam request
+    - tăng khả năng recovery
+
+    Args:
+        request:
+            Google API request object.
+
+        max_retries (int):
+            Số lần retry tối đa.
+
+    Returns:
+        Kết quả execute() của request.
+    """
+
+    for attempt in range(max_retries):
+
+        try:
+            return request.execute()
+
+        except (
+            HttpError,
+            socket.gaierror,
+            http.client.RemoteDisconnected,
+            TimeoutError,
+            ConnectionError,
+        ) as error:
+
+            # =============================================
+            # Nếu là HttpError:
+            # chỉ retry các lỗi server/network
+            # =============================================
+            if isinstance(error, HttpError):
+
+                status = error.resp.status
+
+                retryable_statuses = [
+                    429,
+                    500,
+                    502,
+                    503,
+                    504
+                ]
+
+                # =========================================
+                # Nếu không phải lỗi retry-able
+                # -> throw luôn
+                # =========================================
+                if status not in retryable_statuses:
+                    raise
+
+            # =============================================
+            # Exponential backoff
+            # =============================================
+            wait_time = 2 ** attempt
+
+            print(
+                f"⚠️ Lỗi mạng/API, "
+                f"retry sau {wait_time}s "
+                f"({attempt + 1}/{max_retries})"
+            )
+
+            time.sleep(wait_time)
+
+    # =====================================================
+    # Retry quá số lần cho phép
+    # =====================================================
+    raise Exception("❌ Retry quá số lần cho phép")
 
 
 def get_service():
@@ -130,6 +255,42 @@ def copy_folder(service, source_id, target_parent_id):
         - dùng Google server-side copy
           KHÔNG download về máy
 
+    =====================================================
+    Ưu điểm của server-side copy
+    =====================================================
+
+    - cực nhanh
+    - không tốn bandwidth local
+    - không tốn disk local
+    - không cần download/upload lại
+
+    Google copy trực tiếp bên trong hạ tầng của nó.
+
+    =====================================================
+    Retry Strategy
+    =====================================================
+
+    Các request API đều được wrap bằng:
+        execute_with_retry()
+
+    để tránh:
+    - script chết giữa chừng
+    - mất mạng tạm thời
+    - API timeout
+
+    =====================================================
+    Xử lý lỗi 403
+    =====================================================
+
+    Một số file:
+    - bị disable copy
+    - chỉ có quyền viewer
+    - policy Shared Drive chặn copy
+
+    Khi đó:
+        -> skip file
+        -> tiếp tục script
+
     Args:
         service:
             Google Drive API service object.
@@ -147,10 +308,12 @@ def copy_folder(service, source_id, target_parent_id):
     # fields='name'
     # -> chỉ lấy tên để giảm payload API.
     # =====================================================
-    source_folder = service.files().get(
-        fileId=source_id,
-        fields='name'
-    ).execute()
+    source_folder = execute_with_retry(
+        service.files().get(
+            fileId=source_id,
+            fields='name'
+        )
+    )
 
     source_name = source_folder.get('name')
 
@@ -168,10 +331,12 @@ def copy_folder(service, source_id, target_parent_id):
     # =====================================================
     # Tạo folder mới
     # =====================================================
-    target_folder = service.files().create(
-        body=file_metadata,
-        fields='id'
-    ).execute()
+    target_folder = execute_with_retry(
+        service.files().create(
+            body=file_metadata,
+            fields='id'
+        )
+    )
 
     # =====================================================
     # Lấy ID folder vừa tạo
@@ -186,10 +351,12 @@ def copy_folder(service, source_id, target_parent_id):
     # =====================================================
     query = f"'{source_id}' in parents and trashed = false"
 
-    results = service.files().list(
-        q=query,
-        fields="files(id, name, mimeType)"
-    ).execute()
+    results = execute_with_retry(
+        service.files().list(
+            q=query,
+            fields="files(id, name, mimeType)"
+        )
+    )
 
     items = results.get('files', [])
 
@@ -235,19 +402,62 @@ def copy_folder(service, source_id, target_parent_id):
             }
 
             try:
-                service.files().copy(
-                    fileId=item_id,
-                    body=copy_metadata
-                ).execute()
+                execute_with_retry(
+                    service.files().copy(
+                        fileId=item_id,
+                        body=copy_metadata
+                    )
+                )
 
                 print(f"✅ Copied: {item_name}")
 
             except HttpError as error:
 
+                # =========================================
+                # Một số file bị:
+                # - disable copy
+                # - viewer only
+                # - restricted bởi owner/admin
+                #
+                # Khi đó:
+                # -> skip file
+                # -> tiếp tục script
+                # =========================================
+                if error.resp.status == 403:
+
+                    print(
+                        f"⏭️ Skip file không cho copy: "
+                        f"{item_name}"
+                    )
+
+                    continue
+
+                # =========================================
+                # Lỗi HTTP khác
+                # =========================================
                 print(
                     f"❌ Lỗi copy file "
                     f"{item_name}: {error}"
                 )
+
+                continue
+
+            except Exception as error:
+
+                # =========================================
+                # Các lỗi ngoài dự kiến:
+                # - mạng
+                # - DNS
+                # - timeout
+                # - connection reset
+                # ...
+                # =========================================
+                print(
+                    f"❌ Lỗi khác khi copy file "
+                    f"{item_name}: {error}"
+                )
+
+                continue
 
 
 def main():
