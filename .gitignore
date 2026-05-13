@@ -9,3 +9,4 @@ __pycache__/
 # Các file rác hệ thống
 .DS_Store
 thumbs.db
+.idea
